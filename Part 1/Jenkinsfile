@@ -1,0 +1,276 @@
+pipeline {
+    agent any
+
+    environment {
+        SERVICE_NAME       = "sync-service"
+        GCR_REGISTRY       = "gcr.io/sync-service-registry"
+        GCP_REGION         = "asia-south1"
+        GITHUB_TOKEN       = credentials("github-token")
+        GCP_SA_KEY         = credentials("gcp-sa-key")
+        OPENAI_API_KEY     = credentials("openai-api-key")
+        DOCKER_BUILDKIT    = "1"
+    }
+
+    stages {
+
+        stage("Resolve Version") {
+            steps {
+                script {
+                    def baseVersion = readFile("VERSION").trim()
+                    def branch = env.BRANCH_NAME ?: env.GIT_BRANCH?.replaceAll("origin/", "") ?: "unknown"
+                    def shortSha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+
+                    if (branch == "main") {
+                        env.IMAGE_TAG = baseVersion
+                        env.DEPLOY_ENV = "prod"
+                    } else if (branch.startsWith("release/")) {
+                        def buildNum = env.BUILD_NUMBER
+                        env.IMAGE_TAG = "${baseVersion}-rc.${buildNum}"
+                        env.DEPLOY_ENV = "staging"
+                    } else if (branch == "develop") {
+                        def buildNum = env.BUILD_NUMBER
+                        env.IMAGE_TAG = "${baseVersion}-qa.${buildNum}"
+                        env.DEPLOY_ENV = "qa"
+                    } else {
+                        def safeBranch = branch.replaceAll("[^a-zA-Z0-9]", "-").toLowerCase()
+                        env.IMAGE_TAG = "${baseVersion}-${safeBranch}-${shortSha}"
+                        env.DEPLOY_ENV = "none"
+                    }
+
+                    env.FULL_IMAGE = "${GCR_REGISTRY}/${SERVICE_NAME}:${env.IMAGE_TAG}"
+                    echo "Image: ${env.FULL_IMAGE} | Target env: ${env.DEPLOY_ENV}"
+                }
+            }
+        }
+
+        stage("Build & Unit Test") {
+            steps {
+                sh "./mvnw clean verify -Dspring.profiles.active=test --no-transfer-progress"
+            }
+            post {
+                always {
+                    junit "target/surefire-reports/**/*.xml"
+                }
+            }
+        }
+
+        stage("SAST Scan") {
+            steps {
+                sh "./mvnw dependency-check:check --no-transfer-progress -DfailBuildOnCVSS=7"
+            }
+        }
+
+        stage("OpenAI PR Review") {
+            when {
+                changeRequest()
+            }
+            steps {
+                script {
+                    def diff = sh(script: "git diff origin/${env.CHANGE_TARGET}...HEAD -- '*.java' '*.yml' | head -c 12000", returnStdout: true).trim()
+                    if (!diff) {
+                        echo "No Java or YAML changes detected, skipping AI review."
+                        return
+                    }
+
+                    def prompt = """You are a senior DevOps and Java engineer reviewing a pull request for a Spring Boot service called sync-service that connects to MongoDB.
+
+Review the following diff for:
+1. Security issues (credential exposure, injection risks, improper error handling)
+2. Code quality (naming, unnecessary complexity, test coverage gaps)
+3. Logic errors or edge cases that could cause bugs in production
+
+Be concise. If there are no issues in a category, say so briefly. Format your response as a short, structured review.
+
+Diff:
+${diff}"""
+
+                    def requestBody = groovy.json.JsonOutput.toJson([
+                        model: "gpt-4o",
+                        messages: [[role: "user", content: prompt]],
+                        max_tokens: 800
+                    ])
+
+                    def aiResponse = sh(script: """
+                        curl -s https://api.openai.com/v1/chat/completions \\
+                            -H "Authorization: Bearer ${OPENAI_API_KEY}" \\
+                            -H "Content-Type: application/json" \\
+                            -d '${requestBody}'
+                    """, returnStdout: true).trim()
+
+                    def parsed = readJSON(text: aiResponse)
+                    def reviewComment = parsed.choices[0].message.content
+
+                    def prNumber = env.CHANGE_ID
+                    def repoSlug = env.GIT_URL.replaceAll("https://github.com/", "").replaceAll("\\.git", "")
+
+                    def commentBody = groovy.json.JsonOutput.toJson([
+                        body: "**Automated AI Review (OpenAI GPT-4o)**\n\n${reviewComment}\n\n*This review is advisory and does not replace human review.*"
+                    ])
+
+                    sh """
+                        curl -s -X POST https://api.github.com/repos/${repoSlug}/issues/${prNumber}/comments \\
+                            -H "Authorization: Bearer ${GITHUB_TOKEN}" \\
+                            -H "Content-Type: application/json" \\
+                            -d '${commentBody}'
+                    """
+                }
+            }
+        }
+
+        stage("Docker Build") {
+            steps {
+                sh "docker build --build-arg APP_ENV=${env.DEPLOY_ENV} -t ${env.FULL_IMAGE} ."
+            }
+        }
+
+        stage("Docker Push") {
+            when {
+                not { changeRequest() }
+            }
+            steps {
+                sh "echo ${GCP_SA_KEY} | docker login -u _json_key_base64 --password-stdin https://gcr.io"
+                sh "docker push ${env.FULL_IMAGE}"
+            }
+        }
+
+        stage("Deploy to QA") {
+            when {
+                branch "develop"
+            }
+            steps {
+                script {
+                    deployBlueGreen("qa", env.FULL_IMAGE)
+                }
+            }
+            post {
+                success {
+                    sh "curl -sf http://qa.sync-service.internal/actuator/health | grep -q UP"
+                }
+            }
+        }
+
+        stage("Deploy to Staging") {
+            when {
+                branch pattern: "release/.*", comparator: "REGEXP"
+            }
+            steps {
+                script {
+                    deployBlueGreen("staging", env.FULL_IMAGE)
+                }
+            }
+            post {
+                success {
+                    sh "curl -sf http://staging.sync-service.internal/actuator/health | grep -q UP"
+                }
+            }
+        }
+
+        stage("Production Approval") {
+            when {
+                branch "main"
+            }
+            steps {
+                timeout(time: 30, unit: "MINUTES") {
+                    input message: "Deploy ${env.IMAGE_TAG} to PRODUCTION?",
+                          ok: "Deploy",
+                          submitterParameter: "APPROVED_BY"
+                }
+                echo "Production deployment approved by: ${env.APPROVED_BY}"
+            }
+        }
+
+        stage("Deploy to Production") {
+            when {
+                branch "main"
+            }
+            steps {
+                script {
+                    env.LAST_STABLE_TAG = sh(
+                        script: "gcloud run services describe ${SERVICE_NAME} --region=${GCP_REGION} --format='value(spec.template.metadata.annotations.client.knative.dev/user-image)' 2>/dev/null || echo ''",
+                        returnStdout: true
+                    ).trim()
+
+                    deployBlueGreen("prod", env.FULL_IMAGE)
+                }
+            }
+            post {
+                success {
+                    sh "curl -sf https://sync-service.yourdomain.com/actuator/health | grep -q UP"
+                    slackSend channel: "#deployments",
+                              color: "good",
+                              message: ":rocket: *${SERVICE_NAME}* `${env.IMAGE_TAG}` deployed to production by ${env.APPROVED_BY}"
+                }
+                failure {
+                    script {
+                        if (env.LAST_STABLE_TAG) {
+                            echo "Deployment failed. Rolling back to ${env.LAST_STABLE_TAG}."
+                            deployBlueGreen("prod", env.LAST_STABLE_TAG)
+                            slackSend channel: "#deployments",
+                                      color: "danger",
+                                      message: ":rotating_light: *${SERVICE_NAME}* deployment of `${env.IMAGE_TAG}` failed. Auto-rolled back to `${env.LAST_STABLE_TAG}`."
+                        } else {
+                            echo "No previous stable tag found. Manual intervention required."
+                            slackSend channel: "#deployments",
+                                      color: "danger",
+                                      message: ":sos: *${SERVICE_NAME}* deployment of `${env.IMAGE_TAG}` failed. No rollback target found — manual intervention required."
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        cleanup {
+            sh "docker rmi ${env.FULL_IMAGE} || true"
+            cleanWs()
+        }
+    }
+}
+
+def deployBlueGreen(String environment, String imageTag) {
+    sh """
+        gcloud auth activate-service-account --key-file=${GCP_SA_KEY}
+        gcloud config set project your-gcp-project
+
+        CURRENT_COLOR=\$(gcloud compute forwarding-rules describe ${SERVICE_NAME}-${environment}-fwd \\
+            --region=${GCP_REGION} \\
+            --format='value(labels.active_slot)' 2>/dev/null || echo 'blue')
+
+        if [ "\$CURRENT_COLOR" = "blue" ]; then
+            NEXT_COLOR="green"
+        else
+            NEXT_COLOR="blue"
+        fi
+
+        echo "Current slot: \$CURRENT_COLOR | Deploying to: \$NEXT_COLOR"
+
+        gcloud compute instance-groups managed set-instance-template \\
+            ${SERVICE_NAME}-${environment}-\$NEXT_COLOR \\
+            --template=${SERVICE_NAME}-${environment}-\$NEXT_COLOR-template-new \\
+            --region=${GCP_REGION}
+
+        gcloud compute instance-groups managed rolling-action start-update \\
+            ${SERVICE_NAME}-${environment}-\$NEXT_COLOR \\
+            --version=template=${SERVICE_NAME}-${environment}-template-new \\
+            --region=${GCP_REGION} \\
+            --max-unavailable=0
+
+        gcloud compute instance-groups managed wait-until stable \\
+            ${SERVICE_NAME}-${environment}-\$NEXT_COLOR \\
+            --region=${GCP_REGION} \\
+            --timeout=300
+
+        sleep 10
+
+        gcloud compute backend-services update ${SERVICE_NAME}-${environment}-backend \\
+            --global \\
+            --update-labels active_slot=\$NEXT_COLOR
+
+        gcloud compute forwarding-rules update ${SERVICE_NAME}-${environment}-fwd \\
+            --region=${GCP_REGION} \\
+            --update-labels active_slot=\$NEXT_COLOR
+
+        echo "Traffic switched to \$NEXT_COLOR slot successfully."
+    """
+}
