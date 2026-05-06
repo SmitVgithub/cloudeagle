@@ -86,6 +86,8 @@ feature/* branch push
                    ▼
              Merge allowed
 ```
+
+ ![Alt Text](https://github.com/SmitVgithub/cloudeagle/blob/main/Part%201/ai_review.png)
  
 ---
  
